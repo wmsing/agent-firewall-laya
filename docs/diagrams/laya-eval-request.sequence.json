@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Laya Sidecar 评分全链路",
+    "locale": "zh-CN",
+    "output": "docs/diagrams/laya-eval-request.html",
+    "viewBox": [1080, 640],
+    "column_fit": "spread",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    { "id": "cursor_agent", "type": "external", "label": "Cursor Agent", "sublabel": "工具调用" },
+    { "id": "mcp_server", "type": "messagebus", "label": "MCP", "sublabel": "bash 网关" },
+    { "id": "go_firewall", "type": "security", "label": "agent-firewall", "sublabel": "L1 + HTTP" },
+    { "id": "sidecar", "type": "backend", "label": "Sidecar", "sublabel": "main.py :8288" },
+    { "id": "laya", "type": "cloud", "label": "Laya", "sublabel": "predict" }
+  ],
+  "segments": [
+    { "from": 150, "to": 250, "label": "MCP 入口" },
+    { "from": 260, "to": 400, "label": "Layer 2 语义评分" },
+    { "from": 410, "to": 520, "label": "决策回传" }
+  ],
+  "messages": [
+    { "id": "tool_call", "from": "cursor_agent", "to": "mcp_server", "y": 160, "label": "execute_bash_command(command)" },
+    { "id": "to_firewall", "from": "mcp_server", "to": "go_firewall", "y": 188, "label": "代理请求体（待评估命令文本）", "variant": "emphasis" },
+    { "id": "l1_pass", "from": "go_firewall", "to": "mcp_server", "y": 216, "label": "L1 硬规则通过", "variant": "return", "note": "EVALUATOR_API_URL 已配置时进入 L2" },
+    { "id": "post_eval", "from": "go_firewall", "to": "sidecar", "y": 248, "label": "POST /eval · Bearer · {\"content\":...}", "variant": "security" },
+    { "id": "bearer_ok", "from": "sidecar", "to": "go_firewall", "y": 276, "label": "401 若 Bearer 无效", "variant": "dashed" },
+    { "id": "predict", "from": "sidecar", "to": "laya", "y": 308, "label": "run_in_threadpool(evaluate) → predict", "variant": "emphasis" },
+    { "id": "answers", "from": "laya", "to": "sidecar", "y": 336, "label": "max(noul) → score, reason（全 0→clean）", "variant": "return" },
+    { "id": "eval_ok", "from": "sidecar", "to": "go_firewall", "y": 364, "label": "200 {score, reason, action}", "variant": "return", "note": "Go 只读 score/reason" },
+    { "id": "threshold", "from": "go_firewall", "to": "mcp_server", "y": 392, "label": "score≥0.8 → 403；否则执行 bash", "variant": "security" },
+    { "id": "mcp_result", "from": "mcp_server", "to": "cursor_agent", "y": 420, "label": "工具结果 / 拦截原因", "variant": "return" },
+    { "id": "typesafe_fallback", "from": "go_firewall", "to": "mcp_server", "y": 448, "label": "超时/5xx → TypeSafe（可选）", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "mcp_server", "from": 165, "to": 436, "type": "messagebus" },
+    { "participant": "go_firewall", "from": 183, "to": 410, "type": "security" },
+    { "participant": "sidecar", "from": 243, "to": 382, "type": "backend" },
+    { "participant": "laya", "from": 313, "to": 354, "type": "cloud" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "主路径",
+      "items": [
+        "Cursor 只接触 MCP；语义评分由 agent-firewall 发起 HTTP 调用",
+        "main.py：Bearer 校验后在线程池调用 scoring.evaluate；lifespan 可预热 predict",
+        "响应含 action（score≥0.5 为 BLOCK 提示）；防火墙仍以 score≥0.8 决策"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "契约要点",
+      "items": [
+        "请求字段：content（常为完整待执行命令文本）",
+        "空白 content：200 empty_payload（不调 Laya）；reason 亦可为 clean",
+        "推理失败 5xx；探活用 GET /healthz（无鉴权，不在本序列）"
+      ]
+    }
+  ]
+}

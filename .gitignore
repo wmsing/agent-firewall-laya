@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+bin/
+release/
+.laya/
+library/
+temp/
+local/
+*.log
+.DS_Store
+**/*.visual-check.*
