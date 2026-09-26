@@ -7,12 +7,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from service.scoring import evaluate
+from service.scoring import KevBackend, evaluate
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("laya-evaluator")
-
-DEFAULT_MODEL = "convaiinnovations/laya-typed-decisions"
+logger = logging.getLogger("kev-evaluator")
 
 
 class EvalRequest(BaseModel):
@@ -32,6 +30,13 @@ def _get_api_key() -> str:
     return key
 
 
+def _kev_backend_from_env() -> KevBackend:
+    base = os.environ.get("KEV_BASE_URL", "http://127.0.0.1:8009").strip().rstrip("/")
+    key = os.environ.get("KEV_API_KEY", "local").strip()
+    model = os.environ.get("KEV_MODEL", "kev-latest").strip() or "kev-latest"
+    return KevBackend(base, key, model)
+
+
 def _check_bearer(authorization: str | None, expected_key: str) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing or invalid authorization header")
@@ -40,34 +45,27 @@ def _check_bearer(authorization: str | None, expected_key: str) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def create_app(agent: Any = None) -> FastAPI:
+def create_app(backend: Any = None) -> FastAPI:
     expected_key = _get_api_key()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if agent is not None:
-            app.state.agent = agent
-            logger.info("Using injected mock/custom agent")
+        if backend is not None:
+            app.state.backend = backend
+            logger.info("Using injected mock/custom backend")
         else:
-            import laya
-
-            model_id = os.environ.get("LAYA_MODEL_ID", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-            logger.info(f"Loading Laya model: {model_id}...")
-            loaded_agent = laya.load(model_id)
-
-            # 🚀 啟動預熱：消除首次推理的冷啟動延遲
-            logger.info("Pre-warming Laya model...")
+            loaded = _kev_backend_from_env()
+            logger.info("Kev backend: %s model=%s", loaded.base_url, loaded.model)
             try:
-                evaluate(loaded_agent, "echo ready")
-                logger.info("Laya model successfully warmed up and ready.")
+                evaluate(loaded, "echo ready")
+                logger.info("Kev warmup ok")
             except Exception as e:
-                logger.warning(f"Model warmup failed: {e}")
-
-            app.state.agent = loaded_agent
+                logger.warning("Kev warmup failed (is kev.serve running?): %s", e)
+            app.state.backend = loaded
         yield
         logger.info("Shutting down evaluator service.")
 
-    app = FastAPI(title="Laya Semantic Evaluator", lifespan=lifespan)
+    app = FastAPI(title="Semantic Evaluator Sidecar", lifespan=lifespan)
 
     def require_auth(authorization: Annotated[str | None, Header()] = None) -> None:
         _check_bearer(authorization, expected_key)
@@ -78,8 +76,7 @@ def create_app(agent: Any = None) -> FastAPI:
             return EvalResponse(score=0.0, reason="empty_payload", action="ALLOW")
 
         try:
-            # 🚀 透過 threadpool 執行 CPU/GPU 密集型推理，避免阻塞 asyncio 事件循環
-            score, reason = await run_in_threadpool(evaluate, app.state.agent, body.content)
+            score, reason = await run_in_threadpool(evaluate, app.state.backend, body.content)
         except Exception as exc:
             logger.exception("Inference error occurred")
             raise HTTPException(status_code=500, detail=f"evaluation error: {str(exc)}") from exc

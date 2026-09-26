@@ -3,7 +3,7 @@
 ## 核心命令
 
 - 安装/验收：`make check`
-- 启动 sidecar：`make run`（需 `.env` 中 `EVALUATOR_API_KEY`）
+- 启动 sidecar：`make run`（需 `.env` 中 `EVALUATOR_API_KEY`；另起 Kev：`kev.serve` 默认 `:8009`）
 - 范例：`service/main.py`
 - 关联防火墙：<https://github.com/wmsing/agent-firewall>（`make check-firewall`）
 

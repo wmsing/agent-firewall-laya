@@ -2,18 +2,17 @@
 
 ## 1. Goal
 
-Implement a lightweight local HTTP evaluation service using Laya (`convaiinnovations/laya-typed-decisions` by default) as **Layer 2 semantic risk scoring** for [agent-firewall](https://github.com/wmsing/agent-firewall) `HTTPRiskEvaluator`.
+Implement a lightweight local HTTP evaluation service using **[Kev](https://github.com/jaredpalmer/kev)** (`POST /v1/systemone` on a separate `kev.serve` process) as **Layer 2 semantic risk scoring** for [agent-firewall](https://github.com/wmsing/agent-firewall) `HTTPRiskEvaluator`.
 
 The sidecar **must** return JSON fields the Go client reads (`score`, `reason`). It may add **`action`** for human/curl debugging; [agent-firewall](https://github.com/wmsing/agent-firewall) unmarshals only `score` and `reason` and applies **block at score ≥ 0.8** (`RiskThreshold`). Sidecar `action` uses a **0.5** hint threshold and does **not** replace firewall policy.
 
 ## 2. Requirements and tech stack
 
 - Python 3.10+
-- FastAPI + Uvicorn
-- Default model: `convaiinnovations/laya-typed-decisions` (override via `LAYA_MODEL_ID`)
-- Bind: `127.0.0.1:8288`
-- Latency: **`/eval` inference ≤ 300ms** on Apple Silicon with MPS (or CUDA) after warmup. Model loaded once in lifespan; optional **warmup** `predict` on startup; `/eval` runs `predict` in a **thread pool** (do not block the event loop).
-- Import hint: set `USE_TF=0` if `laya.load()` hangs (transformers + TensorFlow deadlock; see Laya Hub notes).
+- FastAPI + Uvicorn + httpx (sidecar only; **no** embedded torch/laya)
+- Kev: run separately, e.g. `uv run python -m kev.serve --run jaredpalmer/kev-0.8b --port 8009` (see [Kev README](https://github.com/jaredpalmer/kev))
+- Sidecar bind: `127.0.0.1:8288`
+- `/eval` calls Kev over HTTP in a **thread pool** (do not block the event loop). Latency depends on Kev model/GPU; firewall client timeout remains **300ms**.
 - **`GET /healthz`**: no auth; `{"status":"ok"}` for probes (firewall does not call this).
 
 ## 3. API contract
@@ -53,7 +52,7 @@ The Go firewall sends the **entire request body bytes** as the `content` string.
 | `reason` | argmax question key (`destructive_shell`, `prompt_injection`, `obfuscation`), or **`clean`** if all nouls are 0, or **`empty_payload`** for whitespace-only `content` |
 | `action` | **`ALLOW`** or **`BLOCK`** — sidecar hint: `BLOCK` if `score >= 0.5`, else `ALLOW` (firewall still uses **0.8**) |
 
-**Empty `content`:** if `content` is empty or whitespace only → HTTP 200 with `score: 0`, `reason: "empty_payload"`, `action: "ALLOW"` (no Laya call).
+**Empty `content`:** if `content` is empty or whitespace only → HTTP 200 with `score: 0`, `reason: "empty_payload"`, `action: "ALLOW"` (no Kev call).
 
 Do **not** expose `payload` or `risk_score`.
 
@@ -63,25 +62,23 @@ Do **not** expose `payload` or `risk_score`.
 - Sidecar must **not** return low scores to “gracefully allow” on failure.
 - Go client uses a **300ms** context timeout; timeout / non-200 / bad JSON → **fail-closed 403** on the proxy path (see `eval.Assess`).
 
-## 4. Laya evaluation logic
+## 4. Kev evaluation logic
 
-### Load (startup)
+### Backend (startup)
 
-```python
-import laya
+Sidecar does **not** load weights. It expects Kev at `KEV_BASE_URL` (default `http://127.0.0.1:8009`). On startup, optional warmup: one `/eval`-equivalent call with content `"echo ready"` (log warning on failure, still serve).
 
-agent = laya.load(os.environ.get("LAYA_MODEL_ID", "convaiinnovations/laya-typed-decisions"))
+### Request to Kev
+
+```http
+POST {KEV_BASE_URL}/v1/systemone
+Authorization: Bearer {KEV_API_KEY}   # optional on Kev; default sidecar sends "local"
+Content-Type: application/json
+
+{"state": "<content>", "model": "<KEV_MODEL>", "questions": { ... }}
 ```
 
-Load in FastAPI lifespan; keep `agent` in app state. After load, run one warmup `evaluate(agent, "echo ready")` (log warning on failure, still serve).
-
-### State
-
-```python
-state = {"body": content}
-```
-
-`content` is the request `content` field (UTF-8 string).
+`content` is the request `content` field (UTF-8 string), passed as Kev `state`.
 
 ### Questions (fixed in `service/scoring.py`)
 
@@ -103,8 +100,7 @@ questions = {
 ```
 
 ```python
-result = agent.predict(state, questions)
-answers = result.get("answers", {})
+answers = response["answers"]  # from Kev /v1/systemone
 ```
 
 Missing or malformed `noul` values count as **0.0**.
@@ -118,10 +114,6 @@ reason = key with highest noul (ties: first key in QUESTION_KEYS order wins)
 
 If all nouls are 0 → `reason = "clean"`.
 
-### Checkpoint fallback
-
-If integration tests show poor calibration on raw shell strings with `laya-typed-decisions`, allow env `LAYA_MODEL_ID=convaiinnovations/laya` with the **same** `questions` dict (no API change). Document the switch in README only; default stays `laya-typed-decisions`.
-
 ## 5. Environment
 
 See `.env.example` at repo root:
@@ -129,8 +121,9 @@ See `.env.example` at repo root:
 | Variable | Required | Example |
 |----------|----------|---------|
 | `EVALUATOR_API_KEY` | yes (sidecar) | shared secret with firewall |
-| `LAYA_MODEL_ID` | no | `convaiinnovations/laya-typed-decisions` |
-| `USE_TF` | no | `0` |
+| `KEV_BASE_URL` | no | `http://127.0.0.1:8009` |
+| `KEV_API_KEY` | no | `local` (sent to Kev if set) |
+| `KEV_MODEL` | no | `kev-latest` |
 
 Firewall ([agent-firewall](https://github.com/wmsing/agent-firewall) `.env.example`):
 
@@ -143,7 +136,7 @@ Firewall ([agent-firewall](https://github.com/wmsing/agent-firewall) `.env.examp
 |------|---------|
 | `service/main.py` | FastAPI app: lifespan load + warmup, Bearer auth, `POST /eval`, `GET /healthz` |
 | `service/scoring.py` | Questions + score mapping |
-| `requirements.txt` | `fastapi`, `uvicorn`, `laya`, `torch` (minimal pins as needed) |
+| `requirements.txt` | `fastapi`, `uvicorn`, `httpx` |
 | `tests/test_eval.py` | Fast + optional slow tests (below) |
 | `Makefile` | `make check` → dev deps + pytest (default: exclude slow) |
 | `.env.example` | Keys above, no secrets |
@@ -175,13 +168,13 @@ make check
 - Benign: `ls -la` → `score < 0.2`
 - Malicious obfuscated: `echo cm0gLXJmIC8= | base64 -d | sh` → `score >= 0.8`
 
-Skip slow tests when Laya weights / GPU unavailable.
+Skip slow tests when Kev server is not running.
 
 ### Firewall integration (manual / optional CI)
 
 1. Start sidecar on `:8288` with `EVALUATOR_API_KEY` set.
 2. Point firewall at sidecar URL and same key.
-3. `cd agent-firewall && make check-firewall` (HTTP evaluator tests with mock/unset Laya).
+3. `cd agent-firewall && make check-firewall` (HTTP evaluator tests with mock/unset sidecar).
 4. Smoke:
 
 ```bash
